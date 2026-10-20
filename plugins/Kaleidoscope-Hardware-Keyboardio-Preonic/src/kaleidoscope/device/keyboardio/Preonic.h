@@ -439,7 +439,38 @@ class Preonic : public kaleidoscope::device::Base<PreonicProps> {
    */
   static void setupUSBWakeForSleep();
 
+  // Encoders are quadrature switches with no fixed rest level: with two steps
+  // per detent, every other detent leaves A and/or B shorted to ground. A static
+  // SENSE_LOW on such a pin holds the GPIO DETECT signal high for the whole
+  // sleep, and since PORT only fires on a DETECT rising edge, no key press can
+  // wake us until VBUS shows up. Sense the opposite of each pin's current level
+  // so DETECT starts low and any rotation still wakes us.
+  static void configureEncodersForSensing() {
+    for (uint8_t i = 0; i < NUM_ENCODERS; i++) {
+      uint32_t pins[] = {g_ADigitalPinMap[ENCODER_CONFIGS[i].pinA],
+                         g_ADigitalPinMap[ENCODER_CONFIGS[i].pinB]};
+      for (uint32_t pin : pins) {
+        nrf_gpio_cfg_sense_set(pin, nrf_gpio_pin_read(pin) ? NRF_GPIO_PIN_SENSE_LOW : NRF_GPIO_PIN_SENSE_HIGH);
+      }
+    }
+  }
+
+  // Encoders are read through GPIOTE IN channels while awake, so their sense
+  // bits only matter during sleep. Leaving them on would keep DETECT asserted
+  // across the next sleep entry for the same reason as above.
+  static void disableEncoderSensing() {
+    for (uint8_t i = 0; i < NUM_ENCODERS; i++) {
+      nrf_gpio_cfg_sense_set(g_ADigitalPinMap[ENCODER_CONFIGS[i].pinA], NRF_GPIO_PIN_NOSENSE);
+      nrf_gpio_cfg_sense_set(g_ADigitalPinMap[ENCODER_CONFIGS[i].pinB], NRF_GPIO_PIN_NOSENSE);
+    }
+  }
+
   static void setupGPIOTE() {
+    // Clear before arming sense: a pin already at its sense level fires PORT
+    // as soon as it is configured, and clearing afterwards would drop that wake.
+    input_event_pending_    = false;
+    NRF_GPIOTE->EVENTS_PORT = 0;
+
     // Configure each column pin for sense detection
     for (uint8_t i = 0; i < KeyScannerProps::matrix_columns; i++) {
       uint8_t arduino_pin = KeyScannerProps::matrix_col_pins[i];
@@ -450,23 +481,10 @@ class Preonic : public kaleidoscope::device::Base<PreonicProps> {
       nrf_gpio_cfg_sense_input(nrf_pin, NRF_GPIO_PIN_PULLUP, NRF_GPIO_PIN_SENSE_LOW);
     }
 
-    // Configure all rotary encoder pins for sense detection
-    for (uint8_t i = 0; i < NUM_ENCODERS; i++) {
-      // Configure both A and B pins for each encoder
-      uint32_t encoder_a = g_ADigitalPinMap[ENCODER_CONFIGS[i].pinA];
-      uint32_t encoder_b = g_ADigitalPinMap[ENCODER_CONFIGS[i].pinB];
-
-      // Configure encoder pins with pull-ups and LOW sense detection
-      // This won't interfere with SwEncoder because we're just adding sense detection
-      // to the existing pin configuration
-      nrf_gpio_cfg_sense_input(encoder_a, NRF_GPIO_PIN_PULLUP, NRF_GPIO_PIN_SENSE_LOW);
-      nrf_gpio_cfg_sense_input(encoder_b, NRF_GPIO_PIN_PULLUP, NRF_GPIO_PIN_SENSE_LOW);
-    }
+    configureEncodersForSensing();
 
     // Set up PPI to route PORT events to our interrupt handler
     setupPPIInterrupt();
-
-    input_event_pending_ = false;
   }
 
   /**
@@ -618,6 +636,7 @@ class Preonic : public kaleidoscope::device::Base<PreonicProps> {
     sd_power_mode_set(NRF_POWER_MODE_CONSTLAT);
     restoreMatrixAfterSleep();
     disableColumnSensing();
+    disableEncoderSensing();
     //mcu().restoreTimers();
     mcu().restoreRTC();
     mcu().restoreTWIAfterSleep();
